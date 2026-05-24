@@ -59,6 +59,9 @@ nginx_version="1.30.2"
 openssl_version="3.5.6"
 jemalloc_version="5.2.1"
 old_config_status="off"
+AUTO_INSTALL="on"
+AUTO_TLS_VERSION="3"
+AUTO_LINK_VERSION="1"
 # v2ray_plugin_version="$(wget -qO- "https://github.com/shadowsocks/v2ray-plugin/tags" | grep -E "/shadowsocks/v2ray-plugin/releases/tag/" | head -1 | sed -r 's/.*tag\/v(.+)\">.*/\1/')"
 
 #移动旧版本配置信息 对小于 1.1.0 版本适配
@@ -76,23 +79,126 @@ source '/etc/os-release'
 #从VERSION中提取发行版系统的英文名称，为了在debian/ubuntu下添加相对应的Nginx apt源
 VERSION=$(echo "${VERSION}" | awk -F "[()]" '{print $2}')
 
+collect_install_inputs() {
+    while [[ -z "${domain}" ]]; do
+        read -rp "请输入你的域名(例如: www.example.com): " domain
+        domain="${domain// /}"
+    done
+
+    while true; do
+        read -rp "请输入连接端口(default:443): " port
+        [[ -z "${port}" ]] && port="443"
+        if [[ "${port}" =~ ^[0-9]+$ ]] && [[ "${port}" -ge 1 ]] && [[ "${port}" -le 65535 ]]; then
+            break
+        fi
+        echo -e "${Error} ${RedBG} 端口必须是 1-65535 的数字 ${Font}"
+        port=""
+    done
+
+    alterID="0"
+}
+
+apt_sources_backup() {
+    local backup_dir="/etc/apt/codex-source-backup-$(date +%Y%m%d%H%M%S)"
+    mkdir -p "${backup_dir}"
+    [[ -f /etc/apt/sources.list ]] && cp -a /etc/apt/sources.list "${backup_dir}/sources.list"
+    find /etc/apt/sources.list.d -maxdepth 1 \( -name "*.list" -o -name "*.sources" \) -type f -exec cp -a {} "${backup_dir}/" \; >/dev/null 2>&1
+    find /etc/apt/sources.list.d -maxdepth 1 \( -name "*.list" -o -name "*.sources" \) -type f -exec mv {} {}.codexbak \; >/dev/null 2>&1
+    echo -e "${OK} ${GreenBG} APT source backup: ${backup_dir} ${Font}"
+}
+
+write_apt_sources() {
+    local mirror="$1"
+    local codename="${VERSION_CODENAME:-${UBUNTU_CODENAME}}"
+    [[ -z "${codename}" ]] && codename="$(lsb_release -sc 2>/dev/null)"
+    [[ -z "${codename}" ]] && return 1
+
+    if [[ "${ID}" == "ubuntu" ]]; then
+        cat >/etc/apt/sources.list <<EOF
+deb ${mirror} ${codename} main restricted universe multiverse
+deb ${mirror} ${codename}-updates main restricted universe multiverse
+deb ${mirror} ${codename}-backports main restricted universe multiverse
+deb ${mirror} ${codename}-security main restricted universe multiverse
+EOF
+    else
+        cat >/etc/apt/sources.list <<EOF
+deb ${mirror} ${codename} main contrib non-free non-free-firmware
+deb ${mirror} ${codename}-updates main contrib non-free non-free-firmware
+deb ${mirror} ${codename}-backports main contrib non-free non-free-firmware
+deb http://security.debian.org/debian-security ${codename}-security main contrib non-free non-free-firmware
+EOF
+    fi
+}
+
+apt_update_with_fallback() {
+    export DEBIAN_FRONTEND=noninteractive
+    rm -f /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock
+    dpkg --configure -a || true
+    apt-get clean || true
+
+    if apt-get update; then
+        apt-get -y upgrade
+        return 0
+    fi
+
+    apt_sources_backup
+    local mirrors
+    if [[ "${ID}" == "ubuntu" ]]; then
+        mirrors="http://archive.ubuntu.com/ubuntu http://mirrors.aliyun.com/ubuntu http://mirrors.tuna.tsinghua.edu.cn/ubuntu http://mirrors.ustc.edu.cn/ubuntu"
+    else
+        mirrors="http://deb.debian.org/debian http://mirrors.aliyun.com/debian http://mirrors.tuna.tsinghua.edu.cn/debian http://mirrors.ustc.edu.cn/debian"
+    fi
+
+    local mirror
+    for mirror in ${mirrors}; do
+        echo -e "${OK} ${GreenBG} Trying APT source: ${mirror} ${Font}"
+        write_apt_sources "${mirror}" || continue
+        apt-get clean || true
+        if apt-get update; then
+            apt-get -y upgrade
+            echo -e "${OK} ${GreenBG} APT source selected: ${mirror} ${Font}"
+            return 0
+        fi
+    done
+
+    echo -e "${Error} ${RedBG} All APT sources failed ${Font}"
+    return 1
+}
+
+rpm_update_with_fallback() {
+    local pm="${INS}"
+    ${pm} -y makecache && ${pm} -y update && return 0
+
+    if [[ "${ID}" == "centos" ]]; then
+        ${pm} -y install epel-release || true
+        sed -i 's/^mirrorlist=/#mirrorlist=/g;s/^#baseurl=/baseurl=/g;s|http://mirror.centos.org|http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*.repo >/dev/null 2>&1 || true
+    fi
+
+    ${pm} clean all || true
+    ${pm} -y makecache && ${pm} -y update
+}
+
 check_system() {
-    if [[ "${ID}" == "centos" && ${VERSION_ID} -ge 7 ]]; then
+    if [[ "${ID}" == "centos" && ${VERSION_ID%%.*} -ge 7 ]]; then
         echo -e "${OK} ${GreenBG} 当前系统为 Centos ${VERSION_ID} ${VERSION} ${Font}"
-        INS="yum"
-    elif [[ "${ID}" == "debian" && ${VERSION_ID} -ge 8 ]]; then
+        command -v dnf >/dev/null 2>&1 && INS="dnf" || INS="yum"
+        rpm_update_with_fallback
+    elif [[ "${ID}" =~ ^(rhel|rocky|almalinux|ol)$ ]]; then
+        echo -e "${OK} ${GreenBG} 当前系统为 ${ID} ${VERSION_ID} ${VERSION} ${Font}"
+        command -v dnf >/dev/null 2>&1 && INS="dnf" || INS="yum"
+        rpm_update_with_fallback
+    elif [[ "${ID}" == "fedora" ]]; then
+        echo -e "${OK} ${GreenBG} 当前系统为 Fedora ${VERSION_ID} ${VERSION} ${Font}"
+        INS="dnf"
+        rpm_update_with_fallback
+    elif [[ "${ID}" == "debian" && ${VERSION_ID%%.*} -ge 8 ]]; then
         echo -e "${OK} ${GreenBG} 当前系统为 Debian ${VERSION_ID} ${VERSION} ${Font}"
         INS="apt"
-        $INS update
-        ## 添加 Nginx apt源
+        apt_update_with_fallback
     elif [[ "${ID}" == "ubuntu" && $(echo "${VERSION_ID}" | cut -d '.' -f1) -ge 16 ]]; then
         echo -e "${OK} ${GreenBG} 当前系统为 Ubuntu ${VERSION_ID} ${UBUNTU_CODENAME} ${Font}"
         INS="apt"
-        rm -f /var/lib/dpkg/lock
-        dpkg --configure -a
-        rm -f /var/lib/apt/lists/lock
-        rm -f /var/cache/apt/archives/lock
-        $INS update
+        apt_update_with_fallback
     else
         echo -e "${Error} ${RedBG} 当前系统为 ${ID} ${VERSION_ID} 不在支持的系统列表内，安装中断 ${Font}"
         exit 1
@@ -150,7 +256,7 @@ apt_install_any() {
 }
 
 install_dns_utils() {
-    if [[ "${ID}" == "centos" ]]; then
+    if [[ "${INS}" != "apt" ]]; then
         ${INS} -y install bind-utils
     else
         apt_install_any "DNS tools" dnsutils bind9-dnsutils
@@ -158,7 +264,7 @@ install_dns_utils() {
 }
 
 install_netcat() {
-    if [[ "${ID}" == "centos" ]]; then
+    if [[ "${INS}" != "apt" ]]; then
         ${INS} -y install nmap-ncat || ${INS} -y install nc
     else
         apt_install_any "netcat" netcat-openbsd netcat-traditional ncat
@@ -171,7 +277,7 @@ chrony_install() {
 
     timedatectl set-ntp true
 
-    if [[ "${ID}" == "centos" ]]; then
+    if [[ "${INS}" != "apt" ]]; then
         systemctl enable chronyd && systemctl restart chronyd
     else
         systemctl enable chrony && systemctl restart chrony
@@ -206,14 +312,14 @@ dependency_install() {
     install_dns_utils
     judge "安装 DNS tools"
 
-    if [[ "${ID}" == "centos" ]]; then
+    if [[ "${INS}" != "apt" ]]; then
         ${INS} -y install crontabs
     else
         ${INS} -y install cron
     fi
     judge "安装 crontab"
 
-    if [[ "${ID}" == "centos" ]]; then
+    if [[ "${INS}" != "apt" ]]; then
         touch /var/spool/cron/root && chmod 600 /var/spool/cron/root
         systemctl start crond && systemctl enable crond
     else
@@ -235,15 +341,16 @@ dependency_install() {
     ${INS} -y install curl
     judge "安装 curl"
 
-    if [[ "${ID}" == "centos" ]]; then
-        ${INS} -y groupinstall "Development tools"
+    if [[ "${INS}" != "apt" ]]; then
+        ${INS} -y groupinstall "Development tools" || ${INS} -y group install "Development Tools" || ${INS} -y install gcc gcc-c++ make
     else
         ${INS} -y install build-essential
     fi
     judge "编译工具包 安装"
 
-    if [[ "${ID}" == "centos" ]]; then
-        ${INS} -y install pcre pcre-devel zlib-devel epel-release
+    if [[ "${INS}" != "apt" ]]; then
+        ${INS} -y install epel-release || true
+        ${INS} -y install pcre pcre-devel zlib-devel
     else
         ${INS} -y install libpcre3 libpcre3-dev zlib1g-dev dbus
     fi
@@ -256,7 +363,7 @@ dependency_install() {
 
     #    sed -i -r '/^HRNGDEVICE/d;/#HRNGDEVICE=\/dev\/null/a HRNGDEVICE=/dev/urandom' /etc/default/rng-tools
 
-    if [[ "${ID}" == "centos" ]]; then
+    if [[ "${INS}" != "apt" ]]; then
         #       systemctl start rngd && systemctl enable rngd
         #       judge "rng-tools 启动"
         systemctl start haveged && systemctl enable haveged
@@ -288,8 +395,10 @@ basic_optimization() {
 
 port_alterid_set() {
     if [[ "on" != "$old_config_status" ]]; then
-        read -rp "请输入连接端口（default:443）:" port
-        [[ -z ${port} ]] && port="443"
+        if [[ -z "${port}" ]]; then
+            read -rp "请输入连接端口（default:443）:" port
+            [[ -z ${port} ]] && port="443"
+        fi
         alterID="0"
     fi
 }
@@ -475,7 +584,9 @@ ssl_install() {
 }
 
 domain_check() {
-    read -rp "请输入你的域名信息(eg:www.wulabing.com):" domain
+    if [[ -z "${domain}" ]]; then
+        read -rp "请输入你的域名信息(eg:www.wulabing.com):" domain
+    fi
     domain_ipv4="$(dig +short "${domain}" a)"
     domain_ipv6="$(dig +short "${domain}" aaaa)"
     echo -e "${OK} ${GreenBG} 正在获取 公网ip 信息，请耐心等待 ${Font}"
@@ -492,7 +603,8 @@ domain_check() {
         echo -e nameserver 2a01:4f8:c2c:123f::1 > /etc/resolv.conf
         echo -e "${OK} ${GreenBG} 识别为 IPv6 Only 的 VPS，自动添加 DNS64 服务器 ${Font}"
     fi
-    echo -e "域名 DNS 解析到的的 IP：${domain_ip}"
+    echo -e "域名 DNS IPv4: ${domain_ipv4}"
+    echo -e "域名 DNS IPv6: ${domain_ipv6}"
     echo -e "本机IPv4: ${local_ipv4}"
     echo -e "本机IPv6: ${local_ipv6}"
     sleep 2
@@ -576,6 +688,11 @@ v2ray_conf_add_h2() {
 
 old_config_exist_check() {
     if [[ -f $v2ray_qr_config_file ]]; then
+        if [[ "${AUTO_INSTALL}" == "on" ]]; then
+            rm -rf $v2ray_qr_config_file
+            echo -e "${OK} ${GreenBG} 已自动删除旧配置 ${Font}"
+            return
+        fi
         echo -e "${OK} ${GreenBG} 检测到旧配置文件，是否读取旧文件配置 [Y/N]? ${Font}"
         read -r ssl_delete
         case $ssl_delete in
@@ -1160,5 +1277,107 @@ menu() {
     esac
 }
 
+acme_cron_update() {
+    cat >"${ssl_update_file}" <<EOF
+#!/bin/bash
+set -e
+DOMAIN="${domain}"
+ACME="${acme_sh_file}"
+CERT_DIR="/data"
+
+if [[ ! -x "\${ACME}" ]]; then
+    echo "acme.sh not found: \${ACME}"
+    exit 1
+fi
+
+"\${ACME}" --cron --home "/root/.acme.sh"
+mkdir -p "\${CERT_DIR}"
+"\${ACME}" --installcert -d "\${DOMAIN}" --fullchainpath "\${CERT_DIR}/v2ray.crt" --keypath "\${CERT_DIR}/v2ray.key" --ecc --force
+
+systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+systemctl restart v2ray 2>/dev/null || true
+EOF
+    chmod +x "${ssl_update_file}"
+
+    (crontab -l 2>/dev/null | grep -v "${ssl_update_file}"; echo "0 3 1 * * bash ${ssl_update_file} >/var/log/v2ray_ssl_update.log 2>&1") | crontab -
+    judge "SSL certificate monthly auto-renewal"
+}
+
+bbr_boost_sh() {
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    cat >/etc/sysctl.d/99-v2ray-bbr.conf <<EOF
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+    sysctl --system >/dev/null 2>&1 || true
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+        echo -e "${OK} ${GreenBG} BBR enabled ${Font}"
+    else
+        echo -e "${Error} ${RedBG} BBR not available on this kernel, skipped ${Font}"
+    fi
+}
+
+vmess_link_image_choice() {
+    vmess_qr_link_image
+}
+
+tls_type() {
+    if [[ -f "$nginx_conf" ]]; then
+        sed -i 's/ssl_protocols.*/ssl_protocols         TLSv1.3;/' "$nginx_conf"
+        echo -e "${OK} ${GreenBG} TLS set to TLSv1.3 ${Font}"
+    fi
+}
+
+ssl_judge_and_install() {
+    if [[ -f "/data/v2ray.key" || -f "/data/v2ray.crt" ]]; then
+        rm -rf /data/v2ray.crt /data/v2ray.key
+        echo -e "${OK} ${GreenBG} old SSL files removed ${Font}"
+    fi
+
+    if [[ -f "$HOME/.acme.sh/${domain}_ecc/${domain}.key" && -f "$HOME/.acme.sh/${domain}_ecc/${domain}.cer" ]]; then
+        mkdir -p /data
+        "$HOME"/.acme.sh/acme.sh --installcert -d "${domain}" --fullchainpath /data/v2ray.crt --keypath /data/v2ray.key --ecc --force
+        judge "SSL certificate install"
+    else
+        ssl_install
+        acme
+    fi
+}
+
+install_v2ray_ws_tls() {
+    is_root
+    shell_mode="ws"
+    collect_install_inputs
+    check_system
+    chrony_install
+    dependency_install
+    basic_optimization
+    domain_check
+    old_config_exist_check
+    port_alterid_set
+    v2ray_install
+    port_exist_check 80
+    port_exist_check "${port}"
+    nginx_exist_check
+    v2ray_conf_add_tls
+    nginx_conf_add
+    web_camouflage
+    ssl_judge_and_install
+    nginx_systemd
+    vmess_qr_config_tls_ws
+    basic_information
+    vmess_link_image_choice
+    tls_type
+    start_process_systemd
+    enable_process_systemd
+    acme_cron_update
+    bbr_boost_sh
+    show_information
+}
+
 judge_mode
-list "$1"
+if [[ $# -eq 0 ]]; then
+    install_v2ray_ws_tls
+else
+    list "$1"
+fi
