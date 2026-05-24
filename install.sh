@@ -455,11 +455,65 @@ modify_nginx_other() {
 }
 
 web_camouflage() {
-    ##请注意 这里和LNMP脚本的默认路径冲突，千万不要在安装了LNMP的环境下使用本脚本，否则后果自负
     rm -rf /home/wwwroot
-    mkdir -p /home/wwwroot
-    cd /home/wwwroot || exit
-    git clone https://github.com/wulabing/3DCEList.git
+    mkdir -p /home/wwwroot/site
+    cd /home/wwwroot/site || exit
+    wget -q -O hongniu.jpg "https://raw.githubusercontent.com/blue1244/v2myself/main/hongniu.jpg" || true
+    cat >/home/wwwroot/site/index.html <<'EOF'
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Current Time</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #f5f7fa;
+      color: #20242a;
+      font-family: Arial, "Microsoft YaHei", sans-serif;
+    }
+    main {
+      width: min(92vw, 760px);
+      text-align: center;
+      padding: 32px 16px;
+    }
+    time {
+      display: block;
+      margin-bottom: 24px;
+      font-size: clamp(24px, 5vw, 48px);
+      font-weight: 700;
+      line-height: 1.25;
+    }
+    img {
+      display: block;
+      width: 100%;
+      max-height: 70vh;
+      object-fit: contain;
+      border-radius: 8px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <time id="now"></time>
+    <img src="hongniu.jpg" alt="">
+  </main>
+  <script>
+    const el = document.getElementById('now');
+    function tick() {
+      el.textContent = new Date().toLocaleString('zh-CN', { hour12: false });
+    }
+    tick();
+    setInterval(tick, 1000);
+  </script>
+</body>
+</html>
+EOF
     judge "web 站点伪装"
 }
 
@@ -722,7 +776,7 @@ nginx_conf_add() {
         ssl_ciphers           ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
         server_name           serveraddr.com;
         index index.html index.htm;
-        root  /home/wwwroot/3DCEList;
+        root  /home/wwwroot/site;
         error_page 400 = /400.html;
 
         # Config for 0-RTT in TLSv1.3
